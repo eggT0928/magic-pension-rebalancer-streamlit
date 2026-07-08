@@ -8,12 +8,20 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
 import yfinance as yf
+
+try:
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2 import service_account as google_service_account
+except Exception:  # pragma: no cover - handled in the UI at runtime.
+    AuthorizedSession = None
+    google_service_account = None
 
 try:
     import firebase_admin
@@ -31,6 +39,9 @@ DEFAULT_SHEET_URL = (
 )
 DEFAULT_BASE_TOTAL = 22_495_000
 DEFAULT_PROFILE_ID = "personal"
+DEFAULT_SYNC_SHEET_URL = "https://docs.google.com/spreadsheets/d/1jhM6cJONsqk3dvJ0AIa9LkJ3O0Crt3IN500rNFbVr5Y/edit?usp=sharing"
+DEFAULT_SYNC_SHEET_NAME = "StreamlitSync"
+GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 DEFAULT_ASSET_ROWS = [
     ("위험자산", "선진국", "KRX:379800", "KODEX 미국 S&P500TR", 2_699_400, 26_010),
@@ -72,6 +83,8 @@ def default_account() -> dict[str, Any]:
         "principal": 0.0,
         "cash": 0.0,
         "sheetUrl": DEFAULT_SHEET_URL,
+        "syncSheetUrl": DEFAULT_SYNC_SHEET_URL,
+        "syncSheetName": DEFAULT_SYNC_SHEET_NAME,
         "assets": default_assets(),
     }
 
@@ -151,6 +164,8 @@ def normalize_account(raw: dict[str, Any] | None) -> dict[str, Any]:
         "principal": to_float(raw.get("principal")),
         "cash": to_float(raw.get("cash")),
         "sheetUrl": clean_text(raw.get("sheetUrl")) or fallback["sheetUrl"],
+        "syncSheetUrl": clean_text(raw.get("syncSheetUrl") or raw.get("sheetEditUrl")) or fallback["syncSheetUrl"],
+        "syncSheetName": clean_text(raw.get("syncSheetName")) or fallback["syncSheetName"],
         "assets": [normalize_asset(asset) for asset in assets_by_ticker.values()],
     }
 
@@ -165,12 +180,31 @@ def read_secret_section(name: str) -> dict[str, Any] | None:
     return {key: value for key, value in section.items()}
 
 
+def read_service_account_info() -> dict[str, Any] | None:
+    service_account = read_secret_section("firebase_service_account")
+    if service_account:
+        info = dict(service_account)
+    else:
+        json_secret = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        if json_secret:
+            info = json.loads(json_secret)
+        else:
+            local_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if not local_file:
+                return None
+            with open(local_file, encoding="utf-8") as file:
+                info = json.load(file)
+
+    info["private_key"] = str(info.get("private_key", "")).replace("\\n", "\n")
+    return info
+
+
 @st.cache_resource(show_spinner=False)
 def get_firestore_client() -> Any | None:
     if firebase_admin is None or credentials is None:
         return None
 
-    service_account = read_secret_section("firebase_service_account")
+    service_account = read_service_account_info()
     app_name = "streamlit-firestore-rebalancer"
 
     if app_name in firebase_admin._apps:
@@ -178,26 +212,27 @@ def get_firestore_client() -> Any | None:
         return firestore.client(app)
 
     if service_account:
-        service_account["private_key"] = service_account.get("private_key", "").replace("\\n", "\n")
         cred = credentials.Certificate(service_account)
-        app = firebase_admin.initialize_app(cred, name=app_name)
-        return firestore.client(app)
-
-    json_secret = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-    if json_secret:
-        service_account = json.loads(json_secret)
-        service_account["private_key"] = service_account.get("private_key", "").replace("\\n", "\n")
-        cred = credentials.Certificate(service_account)
-        app = firebase_admin.initialize_app(cred, name=app_name)
-        return firestore.client(app)
-
-    local_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if local_file:
-        cred = credentials.Certificate(local_file)
         app = firebase_admin.initialize_app(cred, name=app_name)
         return firestore.client(app)
 
     return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_google_sheets_session() -> Any | None:
+    if AuthorizedSession is None or google_service_account is None:
+        return None
+
+    service_account = read_service_account_info()
+    if not service_account:
+        return None
+
+    creds = google_service_account.Credentials.from_service_account_info(
+        service_account,
+        scopes=[GOOGLE_SHEETS_SCOPE],
+    )
+    return AuthorizedSession(creds)
 
 
 def account_ref(db: Any, profile_id: str) -> Any:
@@ -378,6 +413,261 @@ def parse_sheet_portfolio(csv_text: str) -> dict[str, Any]:
             "principal": principal,
             "cash": cash,
             "sheetUrl": DEFAULT_SHEET_URL,
+            "assets": assets,
+        }
+    )
+
+
+def spreadsheet_id_from_url(value: str) -> str | None:
+    text = clean_text(value)
+    if not text:
+        return None
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
+    if match:
+        return match.group(1)
+    if "/d/e/" in text or "pub?" in text:
+        return None
+    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", text):
+        return text
+    return None
+
+
+def normalize_sheet_name(value: str) -> str:
+    return clean_text(value) or DEFAULT_SYNC_SHEET_NAME
+
+
+def quoted_sheet_range(sheet_name: str, cell_range: str = "A1:Z1000") -> str:
+    escaped_name = normalize_sheet_name(sheet_name).replace("'", "''")
+    return f"'{escaped_name}'!{cell_range}"
+
+
+def column_letter(index: int) -> str:
+    result = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result or "A"
+
+
+def sheets_json_response(response: Any) -> dict[str, Any]:
+    if response.ok:
+        return response.json() if response.content else {}
+    try:
+        message = response.json().get("error", {}).get("message", response.text)
+    except Exception:
+        message = response.text
+    raise RuntimeError(message)
+
+
+def get_spreadsheet_titles(session: Any, spreadsheet_id: str) -> list[str]:
+    response = session.get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
+        params={"fields": "sheets.properties.title"},
+        timeout=15,
+    )
+    data = sheets_json_response(response)
+    return [sheet["properties"]["title"] for sheet in data.get("sheets", [])]
+
+
+def ensure_sheet_tab(session: Any, spreadsheet_id: str, sheet_name: str) -> None:
+    sheet_name = normalize_sheet_name(sheet_name)
+    if sheet_name in get_spreadsheet_titles(session, spreadsheet_id):
+        return
+
+    response = session.post(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate",
+        json={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
+        timeout=15,
+    )
+    sheets_json_response(response)
+
+
+def read_google_sheet_values(session: Any, spreadsheet_id: str, sheet_name: str) -> list[list[Any]]:
+    range_a1 = quoted_sheet_range(sheet_name)
+    response = session.get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quote(range_a1, safe='')}",
+        params={"valueRenderOption": "UNFORMATTED_VALUE"},
+        timeout=15,
+    )
+    data = sheets_json_response(response)
+    return data.get("values", [])
+
+
+def sheet_cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, float):
+        if value == float("inf") or value == float("-inf"):
+            return ""
+        return round(value, 6)
+    return value
+
+
+def account_to_sheet_values(
+    account: dict[str, Any],
+    model_df: pd.DataFrame,
+    metrics: dict[str, float],
+    profile_id: str,
+) -> list[list[Any]]:
+    assets_by_ticker = {asset["ticker"]: asset for asset in account.get("assets", [])}
+    values: list[list[Any]] = [
+        ["연금저축 리밸런서 동기화"],
+        ["updatedAt", datetime.now().isoformat(timespec="seconds")],
+        ["profileId", profile_id],
+        ["accountName", account.get("accountName", "연금저축")],
+        ["리밸런싱 기준금액", to_float(account.get("totalBalance"))],
+        ["원금", to_float(account.get("principal"))],
+        ["예수금", to_float(account.get("cash"))],
+        ["현재 평가액", metrics.get("currentValue", 0.0)],
+        [],
+        [
+            "구분",
+            "분류",
+            "티커",
+            "상품",
+            "목표비중(%)",
+            "보유수량",
+            "수동현재가",
+            "시트가격",
+            "현재적용가",
+            "가격출처",
+            "평가금액",
+            "현재비중(%)",
+            "목표금액",
+            "목표수량",
+            "리밸런싱수량",
+            "거래금액",
+        ],
+    ]
+
+    for _, row in model_df.iterrows():
+        ticker = clean_text(row.get("티커"))
+        asset = assets_by_ticker.get(ticker, {})
+        values.append(
+            [
+                row.get("구분", ""),
+                row.get("분류", ""),
+                ticker,
+                row.get("상품", ""),
+                to_float(row.get("목표비중")) * 100,
+                to_float(asset.get("currentShares")),
+                to_float(asset.get("manualPrice")) or "",
+                to_float(asset.get("fallbackPrice")) or "",
+                to_float(row.get("현재가")),
+                row.get("가격출처", ""),
+                to_float(row.get("평가금액")),
+                to_float(row.get("현재비중")) * 100,
+                to_float(row.get("목표금액")),
+                to_float(row.get("목표수량")),
+                to_float(row.get("리밸런싱수량")),
+                to_float(row.get("거래금액")),
+            ]
+        )
+
+    return [[sheet_cell(cell) for cell in row] for row in values]
+
+
+def write_google_sheet_values(
+    session: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+    values: list[list[Any]],
+) -> None:
+    ensure_sheet_tab(session, spreadsheet_id, sheet_name)
+    clear_range = quoted_sheet_range(sheet_name)
+    session.post(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quote(clear_range, safe='')}:clear",
+        json={},
+        timeout=15,
+    )
+
+    row_count = max(len(values), 1)
+    column_count = max((len(row) for row in values), default=1)
+    update_range = quoted_sheet_range(sheet_name, f"A1:{column_letter(column_count)}{row_count}")
+    response = session.put(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{quote(update_range, safe='')}",
+        params={"valueInputOption": "USER_ENTERED"},
+        json={"range": update_range, "majorDimension": "ROWS", "values": values},
+        timeout=20,
+    )
+    sheets_json_response(response)
+
+
+def find_sync_header_index(rows: list[list[Any]]) -> int:
+    for index, row in enumerate(rows):
+        normalized = [clean_text(cell).replace(" ", "") for cell in row]
+        if "티커" in normalized and "보유수량" in normalized and (
+            "목표비중(%)" in normalized or "목표비중" in normalized
+        ):
+            return index
+    raise ValueError("동기화 탭에서 자산 목록 헤더를 찾지 못했습니다.")
+
+
+def header_lookup(header: list[Any], *names: str) -> int:
+    normalized = [clean_text(cell).replace(" ", "") for cell in header]
+    for name in names:
+        compact = name.replace(" ", "")
+        if compact in normalized:
+            return normalized.index(compact)
+    return -1
+
+
+def parse_google_sync_values(
+    values: list[list[Any]],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    header_index = find_sync_header_index(values)
+    header = values[header_index]
+    metadata: dict[str, Any] = {}
+    for row in values[:header_index]:
+        if len(row) >= 2:
+            key = clean_text(row[0])
+            if key:
+                metadata[key] = row[1]
+
+    ticker_index = header_lookup(header, "티커")
+    name_index = header_lookup(header, "상품")
+    category_index = header_lookup(header, "구분")
+    group_index = header_lookup(header, "분류")
+    target_index = header_lookup(header, "목표비중(%)", "목표비중")
+    shares_index = header_lookup(header, "보유수량")
+    manual_price_index = header_lookup(header, "수동현재가")
+    fallback_price_index = header_lookup(header, "시트가격", "현재가")
+
+    assets: list[dict[str, Any]] = []
+    for row in values[header_index + 1 :]:
+        ticker = clean_text(row_get(row, ticker_index))
+        if not ticker:
+            continue
+        target_value = to_float(row_get(row, target_index))
+        target_weight = target_value / 100 if target_value > 1 else target_value
+        assets.append(
+            normalize_asset(
+                {
+                    "category": row_get(row, category_index) or "기타",
+                    "group": row_get(row, group_index) or row_get(row, category_index) or "기타",
+                    "ticker": ticker,
+                    "name": row_get(row, name_index) or ticker,
+                    "targetWeight": target_weight,
+                    "currentShares": to_float(row_get(row, shares_index)),
+                    "manualPrice": to_optional_float(row_get(row, manual_price_index)),
+                    "fallbackPrice": to_optional_float(row_get(row, fallback_price_index)),
+                }
+            )
+        )
+
+    return normalize_account(
+        {
+            **current,
+            "accountName": clean_text(metadata.get("accountName")) or current.get("accountName", "연금저축"),
+            "totalBalance": to_float(metadata.get("리밸런싱 기준금액"), current.get("totalBalance")),
+            "principal": to_float(metadata.get("원금"), current.get("principal")),
+            "cash": to_float(metadata.get("예수금"), current.get("cash")),
             "assets": assets,
         }
     )
@@ -676,6 +966,8 @@ def merge_imported_assets(imported: dict[str, Any], current: dict[str, Any]) -> 
             asset["manualPrice"] = existing["manualPrice"]
         merged_assets.append(asset)
     imported["assets"] = merged_assets
+    imported["syncSheetUrl"] = current.get("syncSheetUrl") or imported.get("syncSheetUrl", "")
+    imported["syncSheetName"] = current.get("syncSheetName") or imported.get("syncSheetName", DEFAULT_SYNC_SHEET_NAME)
     return imported
 
 
@@ -691,12 +983,13 @@ def render_metric_row(metrics: dict[str, float]) -> None:
 def main() -> None:
     st.set_page_config(page_title="연금저축 리밸런서", page_icon="W", layout="wide")
     st.title("연금저축 리밸런서")
-    st.caption("가격은 Streamlit 서버에서 yfinance로 조회하고, 계좌 설정은 Firestore에 저장합니다.")
+    st.caption("가격은 Streamlit 서버에서 yfinance로 조회하고, 계좌 설정은 Firestore에 저장하며 Google Sheet와 동기화할 수 있습니다.")
 
     if not password_gate():
         st.stop()
 
     db = get_firestore_client()
+    sheets_session = get_google_sheets_session()
 
     with st.sidebar:
         st.header("계좌")
@@ -746,9 +1039,26 @@ def main() -> None:
                 format="%.0f",
             )
         )
-        account["sheetUrl"] = st.text_area("Google Sheet CSV URL", value=account.get("sheetUrl", DEFAULT_SHEET_URL), height=90)
+        account["sheetUrl"] = st.text_area("공개 Google Sheet CSV URL", value=account.get("sheetUrl", DEFAULT_SHEET_URL), height=90)
 
-        import_clicked = st.button("시트 가져오기", use_container_width=True)
+        import_clicked = st.button("공개 CSV에서 가져오기", use_container_width=True)
+
+        st.divider()
+        st.subheader("Google Sheet 동기화")
+        account["syncSheetUrl"] = st.text_area(
+            "편집용 Sheet URL 또는 ID",
+            value=account.get("syncSheetUrl", ""),
+            height=70,
+            help="docs.google.com/spreadsheets/d/... 형식의 편집 URL을 넣고 서비스 계정 이메일에 편집 권한을 공유하세요.",
+        )
+        account["syncSheetName"] = st.text_input(
+            "동기화 탭 이름",
+            value=normalize_sheet_name(account.get("syncSheetName", DEFAULT_SYNC_SHEET_NAME)),
+        )
+        sync_import_clicked = st.button("Sheet에서 앱으로 가져오기", use_container_width=True)
+        sync_export_clicked = st.button("앱에서 Sheet로 내보내기", use_container_width=True)
+
+        st.divider()
         refresh_clicked = st.button("가격 새로고침", use_container_width=True)
         save_clicked = st.button("Firestore에 저장", type="primary", use_container_width=True)
         reload_clicked = st.button("Firestore에서 다시 불러오기", use_container_width=True)
@@ -768,6 +1078,27 @@ def main() -> None:
             st.success(f"{len(account['assets'])}개 자산을 가져왔습니다.")
         except Exception as error:
             st.error(f"시트 가져오기에 실패했습니다: {error}")
+
+    if sync_import_clicked:
+        try:
+            spreadsheet_id = spreadsheet_id_from_url(account.get("syncSheetUrl", ""))
+            if sheets_session is None:
+                raise RuntimeError("Google Sheets 연동에 사용할 서비스 계정 secret이 없습니다.")
+            if not spreadsheet_id:
+                raise RuntimeError("편집 가능한 Google Sheet URL 또는 스프레드시트 ID를 입력하세요.")
+
+            with st.spinner("Google Sheet 동기화 탭에서 가져오는 중입니다."):
+                values = read_google_sheet_values(
+                    sheets_session,
+                    spreadsheet_id,
+                    normalize_sheet_name(account.get("syncSheetName", DEFAULT_SYNC_SHEET_NAME)),
+                )
+                account = parse_google_sync_values(values, account)
+            st.session_state["account"] = account
+            save_account(db, profile_id, account)
+            st.success(f"Google Sheet에서 {len(account['assets'])}개 자산을 가져왔습니다.")
+        except Exception as error:
+            st.error(f"Google Sheet 가져오기에 실패했습니다: {error}")
 
     if refresh_clicked:
         st.session_state["price_refresh_key"] = st.session_state.get("price_refresh_key", 0) + 1
@@ -802,6 +1133,27 @@ def main() -> None:
         prices = fetch_price_snapshot(tickers, st.session_state.get("price_refresh_key", 0))
 
     model_df, metrics = build_model(account, prices)
+
+    if sync_export_clicked:
+        try:
+            spreadsheet_id = spreadsheet_id_from_url(account.get("syncSheetUrl", ""))
+            if sheets_session is None:
+                raise RuntimeError("Google Sheets 연동에 사용할 서비스 계정 secret이 없습니다.")
+            if not spreadsheet_id:
+                raise RuntimeError("편집 가능한 Google Sheet URL 또는 스프레드시트 ID를 입력하세요.")
+
+            with st.spinner("현재 앱 데이터를 Google Sheet로 내보내는 중입니다."):
+                write_google_sheet_values(
+                    sheets_session,
+                    spreadsheet_id,
+                    normalize_sheet_name(account.get("syncSheetName", DEFAULT_SYNC_SHEET_NAME)),
+                    account_to_sheet_values(account, model_df, metrics, profile_id),
+                )
+            save_account(db, profile_id, account)
+            st.success(f"Google Sheet의 {normalize_sheet_name(account.get('syncSheetName', DEFAULT_SYNC_SHEET_NAME))} 탭에 내보냈습니다.")
+        except Exception as error:
+            st.error(f"Google Sheet 내보내기에 실패했습니다: {error}")
+
     render_metric_row(metrics)
 
     tab_summary, tab_prices, tab_export = st.tabs(["리밸런싱", "가격 상태", "내보내기"])
@@ -891,6 +1243,8 @@ def main() -> None:
             {
                 "profileId": profile_id,
                 "firestorePath": f"streamlit_accounts/{profile_id}/accounts/default",
+                "syncSheetName": normalize_sheet_name(account.get("syncSheetName", DEFAULT_SYNC_SHEET_NAME)),
+                "syncSheetConfigured": bool(spreadsheet_id_from_url(account.get("syncSheetUrl", ""))),
                 "targetBase": metrics["targetBase"],
                 "updatedAt": datetime.now().isoformat(timespec="seconds"),
             }
