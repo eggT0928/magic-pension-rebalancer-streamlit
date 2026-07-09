@@ -2,7 +2,7 @@
 
 Streamlit 서버에서 `yfinance`로 현재가를 조회하고, 계좌 설정과 보유수량은 Firebase Firestore에 저장하는 버전입니다.
 국내 ETF는 Yahoo Finance가 실패하면 Naver Finance API를 한 번 더 시도합니다.
-Google Sheet는 공개 CSV에서 초기 데이터를 가져오거나, 편집 가능한 스프레드시트의 전용 탭과 양방향 동기화할 수 있습니다.
+Google Sheet는 편집 가능한 스프레드시트의 전용 탭과 양방향 동기화할 수 있습니다.
 
 ## 실행
 
@@ -21,12 +21,11 @@ Firebase 서비스 계정 키는 Firebase Console의 `Project settings > Service
 
 ## Google Sheet 동기화
 
-앱의 기본 저장소는 Firestore입니다. Google Sheet는 다음 두 방식으로 함께 사용할 수 있습니다.
+앱의 기본 저장소는 Firestore입니다. Google Sheet는 편집 가능한 스프레드시트의 전용 탭을 통해 함께 사용할 수 있습니다.
 
-- 공개 CSV URL: 기존 스프레드시트 구조를 읽어서 앱으로 가져옵니다.
 - 편집용 Sheet URL 또는 ID: 앱에서 수정한 원금, 예수금, 목표비중, 보유수량, 계산 결과를 `StreamlitSync` 같은 전용 탭에 내보내고 다시 가져옵니다.
 
-쓰기 동기화를 쓰려면 Google Sheet의 공유 메뉴에서 Secrets의 `client_email` 서비스 계정에 편집 권한을 주세요. 공개 배포 URL(`/d/e/.../pub?...output=csv`)은 읽기 전용이라 내보내기에는 사용할 수 없습니다.
+동기화를 쓰려면 Google Sheet의 공유 메뉴에서 Secrets의 `client_email` 서비스 계정에 편집 권한을 주세요. 공개 배포 URL(`/d/e/.../pub?...output=csv`)은 사용하지 않습니다.
 
 ## Firestore 저장 위치
 
