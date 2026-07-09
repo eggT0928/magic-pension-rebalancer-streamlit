@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import copy
-import csv
-import io
 import json
 import os
 import re
@@ -32,11 +30,6 @@ except Exception:  # pragma: no cover - handled in the UI at runtime.
     firestore = None
 
 
-DEFAULT_SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/e/"
-    "2PACX-1vQv9goZ9xZ2mJDFu5cmQDlXEtTsfm1D5fMmW8kwVghxQuOosh3k-0q_w3u7h5lBO7f6_KVR988NQzOj/"
-    "pub?gid=636992052&single=true&output=csv"
-)
 DEFAULT_BASE_TOTAL = 22_495_000
 DEFAULT_PROFILE_ID = "personal"
 DEFAULT_SYNC_SHEET_URL = "https://docs.google.com/spreadsheets/d/1jhM6cJONsqk3dvJ0AIa9LkJ3O0Crt3IN500rNFbVr5Y/edit?usp=sharing"
@@ -82,7 +75,6 @@ def default_account() -> dict[str, Any]:
         "totalBalance": float(DEFAULT_BASE_TOTAL),
         "principal": 0.0,
         "cash": 0.0,
-        "sheetUrl": DEFAULT_SHEET_URL,
         "syncSheetUrl": DEFAULT_SYNC_SHEET_URL,
         "syncSheetName": DEFAULT_SYNC_SHEET_NAME,
         "assets": default_assets(),
@@ -163,7 +155,6 @@ def normalize_account(raw: dict[str, Any] | None) -> dict[str, Any]:
         "totalBalance": to_float(raw.get("totalBalance"), fallback["totalBalance"]),
         "principal": to_float(raw.get("principal")),
         "cash": to_float(raw.get("cash")),
-        "sheetUrl": clean_text(raw.get("sheetUrl")) or fallback["sheetUrl"],
         "syncSheetUrl": clean_text(raw.get("syncSheetUrl") or raw.get("sheetEditUrl")) or fallback["syncSheetUrl"],
         "syncSheetName": clean_text(raw.get("syncSheetName")) or fallback["syncSheetName"],
         "assets": [normalize_asset(asset) for asset in assets_by_ticker.values()],
@@ -281,141 +272,6 @@ def password_gate() -> bool:
             st.rerun()
         st.sidebar.error("비밀번호가 맞지 않습니다.")
     return False
-
-
-def fetch_sheet_csv(url: str) -> str:
-    # pandas handles Google Sheets published CSV URLs cleanly and works well on Streamlit Cloud.
-    with pd.io.common.urlopen(url) as response:
-        return response.read().decode("utf-8-sig")
-
-
-def row_get(row: list[str], index: int) -> str:
-    if 0 <= index < len(row):
-        return row[index]
-    return ""
-
-
-def find_header_index(rows: list[list[str]]) -> int:
-    for index, row in enumerate(rows):
-        if (
-            any(clean_text(cell) == "구분" for cell in row)
-            and any(clean_text(cell) == "티커" for cell in row)
-            and any("현재가" in clean_text(cell) for cell in row)
-        ):
-            return index
-    raise ValueError("시트에서 포트폴리오 헤더를 찾지 못했습니다.")
-
-
-def find_column(header: list[str], keyword: str) -> int:
-    for index, cell in enumerate(header):
-        if keyword in clean_text(cell):
-            return index
-    return 0
-
-
-def find_first_money(row: list[str]) -> float:
-    for cell in row:
-        value = to_float(cell)
-        if value > 0:
-            return value
-    return 0.0
-
-
-def detect_account_name(rows: list[list[str]], header_index: int) -> str:
-    for row in rows[:header_index]:
-        for cell in row:
-            text = clean_text(cell)
-            if "연금" in text and len(text) <= 30:
-                return text
-    return "연금저축"
-
-
-def find_principal_and_current(rows: list[list[str]], header_index: int) -> tuple[float, float | None]:
-    for index in range(header_index, min(len(rows) - 1, header_index + 30)):
-        row = rows[index]
-        principal_index = next(
-            (cell_index for cell_index, cell in enumerate(row) if clean_text(cell) == "원금"),
-            -1,
-        )
-        if principal_index >= 0:
-            next_row = rows[index + 1]
-            principal = to_float(row_get(next_row, principal_index))
-            current_value = to_float(row_get(next_row, principal_index + 1))
-            return principal, current_value
-    return 0.0, None
-
-
-def parse_sheet_portfolio(csv_text: str) -> dict[str, Any]:
-    rows = list(csv.reader(io.StringIO(csv_text)))
-    header_index = find_header_index(rows)
-    header = rows[header_index]
-
-    ticker_index = find_column(header, "티커")
-    name_index = find_column(header, "상품")
-    target_value_index = find_column(header, "총자산 분배")
-    price_index = find_column(header, "현재가")
-    holding_index = find_column(header, "보유 수량")
-
-    total_balance = find_first_money(rows[header_index + 1]) or DEFAULT_BASE_TOTAL
-    account_name = detect_account_name(rows, header_index)
-    assets: list[dict[str, Any]] = []
-    last_category = ""
-    last_group = ""
-
-    for row in rows[header_index + 2 :]:
-        if not row:
-            continue
-        if any(clean_text(cell) == "구분" for cell in row) and any(clean_text(cell) == "티커" for cell in row):
-            break
-        if any("사용법" in clean_text(cell) for cell in row):
-            break
-
-        ticker = clean_text(row_get(row, ticker_index))
-        ticker_ok = ticker.startswith("KRX:") or ticker == "현금" or bool(re.match(r"^[A-Z0-9.-]+$", ticker))
-        if not ticker or not ticker_ok:
-            continue
-
-        category = clean_text(row_get(row, 0)) or last_category or "기타"
-        group = clean_text(row_get(row, 1)) or last_group or category
-        last_category = category
-        last_group = group
-
-        target_value = (
-            to_float(row_get(row, price_index - 1))
-            or to_float(row_get(row, target_value_index))
-            or to_float(row_get(row, target_value_index + 1))
-        )
-        fallback_price = to_optional_float(row_get(row, price_index))
-        current_shares = to_float(row_get(row, holding_index))
-
-        assets.append(
-            {
-                "id": ticker,
-                "category": category,
-                "group": group,
-                "ticker": ticker,
-                "name": clean_text(row_get(row, name_index)) or ticker,
-                "targetWeight": target_value / total_balance if total_balance else 0.0,
-                "currentShares": current_shares,
-                "fallbackPrice": fallback_price,
-                "manualPrice": None,
-            }
-        )
-
-    principal, current_value = find_principal_and_current(rows, header_index)
-    holdings_value = sum(to_float(asset["currentShares"]) * to_float(asset["fallbackPrice"]) for asset in assets)
-    cash = max(0.0, (current_value or 0.0) - holdings_value) if current_value else 0.0
-
-    return normalize_account(
-        {
-            "accountName": account_name,
-            "totalBalance": total_balance,
-            "principal": principal,
-            "cash": cash,
-            "sheetUrl": DEFAULT_SHEET_URL,
-            "assets": assets,
-        }
-    )
 
 
 def spreadsheet_id_from_url(value: str) -> str | None:
@@ -957,20 +813,6 @@ def editor_frame_to_assets(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return assets
 
 
-def merge_imported_assets(imported: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
-    existing_by_ticker = {asset["ticker"]: asset for asset in current.get("assets", [])}
-    merged_assets = []
-    for asset in imported["assets"]:
-        existing = existing_by_ticker.get(asset["ticker"], {})
-        if to_float(existing.get("manualPrice")) > 0:
-            asset["manualPrice"] = existing["manualPrice"]
-        merged_assets.append(asset)
-    imported["assets"] = merged_assets
-    imported["syncSheetUrl"] = current.get("syncSheetUrl") or imported.get("syncSheetUrl", "")
-    imported["syncSheetName"] = current.get("syncSheetName") or imported.get("syncSheetName", DEFAULT_SYNC_SHEET_NAME)
-    return imported
-
-
 def render_metric_row(metrics: dict[str, float]) -> None:
     cols = st.columns(5)
     cols[0].metric("현재 평가액", format_krw(metrics["currentValue"]))
@@ -1039,10 +881,6 @@ def main() -> None:
                 format="%.0f",
             )
         )
-        account["sheetUrl"] = st.text_area("공개 Google Sheet CSV URL", value=account.get("sheetUrl", DEFAULT_SHEET_URL), height=90)
-
-        import_clicked = st.button("공개 CSV에서 가져오기", use_container_width=True)
-
         st.divider()
         st.subheader("Google Sheet 동기화")
         account["syncSheetUrl"] = st.text_area(
@@ -1066,18 +904,6 @@ def main() -> None:
     if reload_clicked:
         st.session_state["account"] = load_account(db, profile_id)
         st.rerun()
-
-    if import_clicked:
-        try:
-            with st.spinner("Google Sheet 포트폴리오를 가져오는 중입니다."):
-                imported_account = parse_sheet_portfolio(fetch_sheet_csv(account["sheetUrl"]))
-            imported_account["sheetUrl"] = account["sheetUrl"]
-            account = merge_imported_assets(imported_account, account)
-            st.session_state["account"] = account
-            save_account(db, profile_id, account)
-            st.success(f"{len(account['assets'])}개 자산을 가져왔습니다.")
-        except Exception as error:
-            st.error(f"시트 가져오기에 실패했습니다: {error}")
 
     if sync_import_clicked:
         try:
