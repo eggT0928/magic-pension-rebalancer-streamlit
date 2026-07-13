@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -32,7 +33,7 @@ except Exception:  # pragma: no cover - handled in the UI at runtime.
 
 DEFAULT_BASE_TOTAL = 22_495_000
 DEFAULT_PROFILE_ID = "personal"
-DEFAULT_SYNC_SHEET_URL = "https://docs.google.com/spreadsheets/d/1jhM6cJONsqk3dvJ0AIa9LkJ3O0Crt3IN500rNFbVr5Y/edit?usp=sharing"
+DEFAULT_SYNC_SHEET_URL = ""
 DEFAULT_SYNC_SHEET_NAME = "StreamlitSync"
 GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
@@ -119,6 +120,49 @@ def format_percent(value: float) -> str:
 def sanitize_profile_id(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9가-힣_.-]+", "-", value.strip())
     return cleaned[:80] or DEFAULT_PROFILE_ID
+
+
+def read_secret(name: str, default: str = "") -> str:
+    try:
+        return clean_text(st.secrets.get(name, default))
+    except Exception:
+        return default
+
+
+def oidc_is_configured() -> bool:
+    try:
+        auth = st.secrets.get("auth")
+    except Exception:
+        return False
+    if not auth:
+        return False
+    return all(clean_text(auth.get(key)) for key in ("redirect_uri", "cookie_secret", "client_id", "client_secret"))
+
+
+def authenticated_profile() -> tuple[str, str] | None:
+    if not oidc_is_configured():
+        return None
+
+    if not st.user.is_logged_in:
+        st.subheader("Google 계정으로 로그인")
+        st.write("로그인한 사용자마다 원금, 보유수량과 Google Sheet 설정이 별도로 저장됩니다.")
+        st.button("Google 계정으로 로그인", type="primary", on_click=st.login)
+        st.stop()
+
+    email = clean_text(st.user.get("email")).lower()
+    subject = clean_text(st.user.get("sub")) or email
+    if not subject:
+        st.error("로그인 사용자 식별 정보를 확인할 수 없습니다.")
+        st.stop()
+
+    legacy_owner_email = read_secret("LEGACY_OWNER_EMAIL").lower()
+    if legacy_owner_email and email == legacy_owner_email:
+        profile_id = DEFAULT_PROFILE_ID
+    else:
+        profile_id = f"google-{hashlib.sha256(subject.encode('utf-8')).hexdigest()[:32]}"
+
+    display_name = clean_text(st.user.get("name")) or email or "사용자"
+    return profile_id, display_name
 
 
 def normalize_asset(asset: dict[str, Any]) -> dict[str, Any]:
@@ -272,6 +316,12 @@ def password_gate() -> bool:
             st.rerun()
         st.sidebar.error("비밀번호가 맞지 않습니다.")
     return False
+
+
+def row_get(row: list[Any], index: int) -> Any:
+    if 0 <= index < len(row):
+        return row[index]
+    return ""
 
 
 def spreadsheet_id_from_url(value: str) -> str | None:
@@ -523,108 +573,7 @@ def parse_google_sync_values(
             "accountName": clean_text(metadata.get("accountName")) or current.get("accountName", "연금저축"),
             "totalBalance": to_float(metadata.get("리밸런싱 기준금액"), current.get("totalBalance")),
             "principal": to_float(metadata.get("원금"), current.get("principal")),
-            "cash": to_float(metadata.get("예수금"), current.get("cash")),
-            "assets": assets,
-        }
-    )
-
-
-def yahoo_symbols_for_ticker(ticker: str) -> list[str]:
-    ticker = clean_text(ticker)
-    if ticker == "현금":
-        return ["CASH"]
-    if ticker.startswith("KRX:"):
-        code = ticker.replace("KRX:", "").strip()
-        return [f"{code}.KS", f"{code}.KQ"]
-    return [ticker]
-
-
-def read_fast_price(symbol: str) -> float | None:
-    ticker = yf.Ticker(symbol)
-    try:
-        fast_info = ticker.fast_info
-        price = fast_info.get("last_price") if hasattr(fast_info, "get") else fast_info["last_price"]
-        if price and float(price) > 0:
-            return float(price)
-    except Exception:
-        pass
-
-    for period, interval in [("1d", "1m"), ("5d", "1d")]:
-        try:
-            history = ticker.history(period=period, interval=interval, auto_adjust=False)
-            if not history.empty and "Close" in history:
-                close = history["Close"].dropna()
-                if not close.empty and float(close.iloc[-1]) > 0:
-                    return float(close.iloc[-1])
-        except Exception:
-            continue
-    return None
-
-
-def naver_code_for_ticker(ticker: str) -> str | None:
-    ticker = clean_text(ticker)
-    if ticker.startswith("KRX:"):
-        return ticker.replace("KRX:", "").strip()
-    if re.fullmatch(r"[0-9A-Z]{6}", ticker):
-        return ticker
-    return None
-
-
-def parse_market_number(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace(",", "")
-    if not text:
-        return None
-    text = re.sub(r"[^0-9.\-]", "", text)
-    if text in {"", "-", ".", "-."}:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def find_naver_quote_object(payload: Any, code: str) -> dict[str, Any] | None:
-    stack = [payload]
-    while stack:
-        value = stack.pop()
-        if not isinstance(value, (dict, list)):
-            continue
-        if isinstance(value, dict):
-            item_code = value.get("itemCode") or value.get("stockCode") or value.get("code") or value.get("cd")
-            has_price = (
-                value.get("closePrice")
-                or value.get("currentPrice")
-                or value.get("tradePrice")
-                or value.get("now")
-                or value.get("nv")
-                or value.get("lastPrice")
-            )
-            if has_price and (not item_code or str(item_code) == str(code)):
-                return value
-            stack.extend(child for child in value.values() if isinstance(child, (dict, list)))
-        else:
-            stack.extend(child for child in value if isinstance(child, (dict, list)))
-    return None
-
-
-def read_naver_price(code: str) -> float | None:
-    urls = [
-        f"https://api.stock.naver.com/stock/{code}/basic",
-        f"https://m.stock.naver.com/api/stock/{code}/basic",
-        f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}",
-    ]
-    headers = {
-        "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0",
-    }
-
-    for url in urls:
-        try:
-            response = requests.get(url, headers=headers, timeout=8)
+            "cash": to_float(metadata.get("예수…804 tokens truncated…          response = requests.get(url, headers=headers, timeout=8)
             response.raise_for_status()
             quote = find_naver_quote_object(response.json(), code)
             if not quote:
@@ -827,7 +776,8 @@ def main() -> None:
     st.title("연금저축 리밸런서")
     st.caption("가격은 Streamlit 서버에서 yfinance로 조회하고, 계좌 설정은 Firestore에 저장하며 Google Sheet와 동기화할 수 있습니다.")
 
-    if not password_gate():
+    identity = authenticated_profile()
+    if identity is None and not password_gate():
         st.stop()
 
     db = get_firestore_client()
@@ -835,12 +785,15 @@ def main() -> None:
 
     with st.sidebar:
         st.header("계좌")
-        profile_default = DEFAULT_PROFILE_ID
-        try:
-            profile_default = str(st.secrets.get("DEFAULT_PROFILE_ID", DEFAULT_PROFILE_ID))
-        except Exception:
-            pass
-        profile_id = sanitize_profile_id(st.text_input("프로필 ID", value=profile_default))
+        if identity is not None:
+            profile_id, display_name = identity
+            st.write(f"{display_name}님")
+            if st.button("로그아웃", use_container_width=True):
+                st.logout()
+        else:
+            profile_default = read_secret("DEFAULT_PROFILE_ID", DEFAULT_PROFILE_ID)
+            profile_id = sanitize_profile_id(st.text_input("프로필 ID", value=profile_default))
+            st.warning("Google 로그인이 설정되지 않아 공용 비밀번호 방식으로 실행 중입니다.")
 
         if st.session_state.get("loaded_profile_id") != profile_id:
             st.session_state["account"] = load_account(db, profile_id)
@@ -1079,3 +1032,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
