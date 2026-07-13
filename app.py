@@ -36,6 +36,12 @@ DEFAULT_PROFILE_ID = "personal"
 DEFAULT_SYNC_SHEET_URL = ""
 DEFAULT_SYNC_SHEET_NAME = "StreamlitSync"
 GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+GOLD_GROUP_NAME = "금"
+DEFAULT_GOLD_TARGET_WEIGHT = 0.20
+GOLD_INITIAL_ALLOCATION = {
+    "KRX:0072R0": 1_730_960 / 4_499_000,
+    "KRX:411060": 2_768_040 / 4_499_000,
+}
 
 DEFAULT_ASSET_ROWS = [
     ("위험자산", "선진국", "KRX:379800", "KODEX 미국 S&P500TR", 2_699_400, 26_010),
@@ -61,7 +67,7 @@ def default_assets() -> list[dict[str, Any]]:
             "group": group,
             "ticker": ticker,
             "name": name,
-            "targetWeight": target_value / DEFAULT_BASE_TOTAL,
+            "targetWeight": 0.0 if group == GOLD_GROUP_NAME else target_value / DEFAULT_BASE_TOTAL,
             "currentShares": 0.0,
             "fallbackPrice": float(fallback_price),
             "manualPrice": None,
@@ -76,6 +82,7 @@ def default_account() -> dict[str, Any]:
         "totalBalance": float(DEFAULT_BASE_TOTAL),
         "principal": 0.0,
         "cash": 0.0,
+        "goldTargetWeight": DEFAULT_GOLD_TARGET_WEIGHT,
         "syncSheetUrl": DEFAULT_SYNC_SHEET_URL,
         "syncSheetName": DEFAULT_SYNC_SHEET_NAME,
         "assets": default_assets(),
@@ -167,13 +174,14 @@ def authenticated_profile() -> tuple[str, str] | None:
 
 def normalize_asset(asset: dict[str, Any]) -> dict[str, Any]:
     ticker = clean_text(asset.get("ticker") or asset.get("id"))
+    group = clean_text(asset.get("group")) or clean_text(asset.get("category")) or "기타"
     return {
         "id": ticker,
         "category": clean_text(asset.get("category")) or "기타",
-        "group": clean_text(asset.get("group")) or clean_text(asset.get("category")) or "기타",
+        "group": group,
         "ticker": ticker,
         "name": clean_text(asset.get("name")) or ticker,
-        "targetWeight": to_float(asset.get("targetWeight")),
+        "targetWeight": 0.0 if group == GOLD_GROUP_NAME else to_float(asset.get("targetWeight")),
         "currentShares": to_float(asset.get("currentShares")),
         "fallbackPrice": to_optional_float(asset.get("fallbackPrice")),
         "manualPrice": to_optional_float(asset.get("manualPrice")),
@@ -199,6 +207,7 @@ def normalize_account(raw: dict[str, Any] | None) -> dict[str, Any]:
         "totalBalance": to_float(raw.get("totalBalance"), fallback["totalBalance"]),
         "principal": to_float(raw.get("principal")),
         "cash": to_float(raw.get("cash")),
+        "goldTargetWeight": to_float(raw.get("goldTargetWeight"), DEFAULT_GOLD_TARGET_WEIGHT),
         "syncSheetUrl": clean_text(raw.get("syncSheetUrl") or raw.get("sheetEditUrl")) or fallback["syncSheetUrl"],
         "syncSheetName": clean_text(raw.get("syncSheetName")) or fallback["syncSheetName"],
         "assets": [normalize_asset(asset) for asset in assets_by_ticker.values()],
@@ -429,6 +438,7 @@ def account_to_sheet_values(
         ["리밸런싱 기준금액", to_float(account.get("totalBalance"))],
         ["원금", to_float(account.get("principal"))],
         ["예수금", to_float(account.get("cash"))],
+        ["금 ETF 합산 목표비중(%)", to_float(account.get("goldTargetWeight"), DEFAULT_GOLD_TARGET_WEIGHT) * 100],
         ["현재 평가액", metrics.get("currentValue", 0.0)],
         [],
         [
@@ -574,6 +584,11 @@ def parse_google_sync_values(
             "totalBalance": to_float(metadata.get("리밸런싱 기준금액"), current.get("totalBalance")),
             "principal": to_float(metadata.get("원금"), current.get("principal")),
             "cash": to_float(metadata.get("예수금"), current.get("cash")),
+            "goldTargetWeight": to_float(
+                metadata.get("금 ETF 합산 목표비중(%)"),
+                to_float(current.get("goldTargetWeight"), DEFAULT_GOLD_TARGET_WEIGHT) * 100,
+            )
+            / 100,
             "assets": assets,
         }
     )
@@ -661,7 +676,7 @@ def find_naver_quote_object(payload: Any, code: str) -> dict[str, Any] | None:
     return None
 
 
-def read_naver_price(code: str) -> float | None:
+def read_naver_quote(code: str) -> dict[str, Any] | None:
     urls = [
         f"https://api.stock.naver.com/stock/{code}/basic",
         f"https://m.stock.naver.com/api/stock/{code}/basic",
@@ -688,19 +703,48 @@ def read_naver_price(code: str) -> float | None:
                 or quote.get("lastPrice")
             )
             if price and price > 0:
-                return price
+                quote_time = next(
+                    (
+                        clean_text(quote.get(key))
+                        for key in ("localTradedAt", "tradedAt", "tradeTime", "dateTime", "time")
+                        if clean_text(quote.get(key))
+                    ),
+                    "",
+                )
+                return {"price": price, "asOf": quote_time or None}
         except Exception:
             continue
     return None
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+def read_naver_price(code: str) -> float | None:
+    quote = read_naver_quote(code)
+    return to_optional_float(quote.get("price")) if quote else None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_price_snapshot(tickers: tuple[str, ...], refresh_key: int) -> dict[str, dict[str, Any]]:
     del refresh_key
     snapshot: dict[str, dict[str, Any]] = {}
 
     for ticker in tickers:
         errors: list[str] = []
+        queried_at = datetime.now(timezone.utc).isoformat()
+        naver_code = naver_code_for_ticker(ticker)
+        if naver_code:
+            naver_quote = read_naver_quote(naver_code)
+            if naver_quote and to_float(naver_quote.get("price")) > 0:
+                snapshot[ticker] = {
+                    "ok": True,
+                    "price": naver_quote["price"],
+                    "source": "Naver",
+                    "symbol": naver_code,
+                    "asOf": naver_quote.get("asOf"),
+                    "queriedAt": queried_at,
+                }
+                continue
+            errors.append(f"Naver {naver_code}: no price")
+
         for symbol in yahoo_symbols_for_ticker(ticker):
             if symbol == "CASH":
                 snapshot[ticker] = {
@@ -708,7 +752,8 @@ def fetch_price_snapshot(tickers: tuple[str, ...], refresh_key: int) -> dict[str
                     "price": 1.0,
                     "source": "현금",
                     "symbol": symbol,
-                    "asOf": datetime.now(timezone.utc).isoformat(),
+                    "asOf": None,
+                    "queriedAt": queried_at,
                 }
                 break
             try:
@@ -719,26 +764,14 @@ def fetch_price_snapshot(tickers: tuple[str, ...], refresh_key: int) -> dict[str
                         "price": price,
                         "source": "Yahoo",
                         "symbol": symbol,
-                        "asOf": datetime.now(timezone.utc).isoformat(),
+                        "asOf": None,
+                        "queriedAt": queried_at,
                     }
                     break
                 errors.append(f"{symbol}: no price")
             except Exception as error:
                 errors.append(f"{symbol}: {error}")
         else:
-            naver_code = naver_code_for_ticker(ticker)
-            if naver_code:
-                naver_price = read_naver_price(naver_code)
-                if naver_price and naver_price > 0:
-                    snapshot[ticker] = {
-                        "ok": True,
-                        "price": naver_price,
-                        "source": "Naver",
-                        "symbol": naver_code,
-                        "asOf": datetime.now(timezone.utc).isoformat(),
-                    }
-                    continue
-                errors.append(f"Naver {naver_code}: no price")
             snapshot[ticker] = {"ok": False, "price": None, "source": "없음", "error": " / ".join(errors)}
 
     return snapshot
@@ -798,6 +831,18 @@ def build_model(account: dict[str, Any], prices: dict[str, dict[str, Any]]) -> t
         return df, metrics
 
     df["현재비중"] = df["평가금액"] / current_value if current_value > 0 else 0.0
+    gold_mask = df["분류"].eq(GOLD_GROUP_NAME)
+    if gold_mask.any():
+        gold_target_weight = to_float(account.get("goldTargetWeight"), DEFAULT_GOLD_TARGET_WEIGHT)
+        gold_values = df.loc[gold_mask, "평가금액"]
+        if float(gold_values.sum()) > 0:
+            gold_allocation = gold_values / float(gold_values.sum())
+        else:
+            initial = df.loc[gold_mask, "티커"].map(GOLD_INITIAL_ALLOCATION).fillna(0.0)
+            if float(initial.sum()) <= 0:
+                initial = pd.Series(1.0, index=df.index[gold_mask])
+            gold_allocation = initial / float(initial.sum())
+        df.loc[gold_mask, "목표비중"] = gold_target_weight * gold_allocation
     df["목표금액"] = target_base * df["목표비중"]
     df["목표수량"] = (df["목표금액"] / df["현재가"].replace(0, pd.NA)).fillna(0).astype(float).apply(int)
     df["리밸런싱수량"] = df["목표수량"] - df["보유수량"]
@@ -830,7 +875,9 @@ def assets_to_editor_frame(assets: list[dict[str, Any]]) -> pd.DataFrame:
                 "분류": asset["group"],
                 "티커": asset["ticker"],
                 "상품": asset["name"],
-                "목표비중(%)": to_float(asset.get("targetWeight")) * 100,
+                "목표비중(%)": None
+                if asset.get("group") == GOLD_GROUP_NAME
+                else to_float(asset.get("targetWeight")) * 100,
                 "보유수량": to_float(asset.get("currentShares")),
                 "수동현재가": to_float(asset.get("manualPrice")),
                 "시트가격": to_float(asset.get("fallbackPrice")),
@@ -853,7 +900,9 @@ def editor_frame_to_assets(frame: pd.DataFrame) -> list[dict[str, Any]]:
                     "group": row.get("분류") or row.get("구분") or "기타",
                     "ticker": ticker,
                     "name": row.get("상품") or ticker,
-                    "targetWeight": to_float(row.get("목표비중(%)")) / 100,
+                    "targetWeight": 0.0
+                    if clean_text(row.get("분류")) == GOLD_GROUP_NAME
+                    else to_float(row.get("목표비중(%)")) / 100,
                     "currentShares": to_float(row.get("보유수량")),
                     "manualPrice": to_optional_float(row.get("수동현재가")),
                     "fallbackPrice": to_optional_float(row.get("시트가격")),
@@ -875,7 +924,7 @@ def render_metric_row(metrics: dict[str, float]) -> None:
 def main() -> None:
     st.set_page_config(page_title="연금저축 리밸런서", page_icon="W", layout="wide")
     st.title("연금저축 리밸런서")
-    st.caption("가격은 Streamlit 서버에서 yfinance로 조회하고, 계좌 설정은 Firestore에 저장하며 Google Sheet와 동기화할 수 있습니다.")
+    st.caption("국내 가격은 Naver를 우선 조회하고, 계좌 설정은 Firestore에 저장하며 Google Sheet와 동기화할 수 있습니다.")
 
     identity = authenticated_profile()
     if identity is None and not password_gate():
@@ -935,6 +984,17 @@ def main() -> None:
                 format="%.0f",
             )
         )
+        account["goldTargetWeight"] = float(
+            st.number_input(
+                "금 ETF 합산 목표비중(%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(to_float(account.get("goldTargetWeight"), DEFAULT_GOLD_TARGET_WEIGHT) * 100),
+                step=0.5,
+                format="%.1f",
+            )
+            / 100
+        )
         st.divider()
         st.subheader("Google Sheet 동기화")
         account["syncSheetUrl"] = st.text_area(
@@ -985,6 +1045,7 @@ def main() -> None:
 
     st.subheader(account.get("accountName", "연금저축"))
     st.write("자산별 목표비중, 보유수량, 수동현재가를 수정한 뒤 저장하면 Firestore에 반영됩니다.")
+    st.caption("금 ETF는 개별 목표비중을 사용하지 않습니다. 두 금 종목의 합산 목표를 현재 평가액 비율로 나눠 계산합니다.")
 
     editor_frame = assets_to_editor_frame(account["assets"])
     edited_frame = st.data_editor(
@@ -1009,7 +1070,7 @@ def main() -> None:
         st.success("Firestore에 저장했습니다." if db else "현재 세션에 저장했습니다.")
 
     tickers = tuple(asset["ticker"] for asset in account["assets"] if asset.get("ticker"))
-    with st.spinner("Yahoo Finance 현재가를 확인하는 중입니다."):
+    with st.spinner("현재가를 확인하는 중입니다."):
         prices = fetch_price_snapshot(tickers, st.session_state.get("price_refresh_key", 0))
 
     model_df, metrics = build_model(account, prices)
@@ -1100,15 +1161,17 @@ def main() -> None:
             price_rows.append(
                 {
                     "티커": ticker,
-                    "Yahoo 심볼": price_info.get("symbol", ", ".join(yahoo_symbols_for_ticker(ticker))),
+                    "조회 심볼": price_info.get("symbol", ", ".join(yahoo_symbols_for_ticker(ticker))),
                     "현재 적용가": price,
                     "적용 출처": source,
+                    "시세시각": price_info.get("asOf") or "확인 불가",
+                    "조회시각(UTC)": price_info.get("queriedAt") or "",
                     "조회 성공": bool(price_info.get("ok")),
                     "오류": price_info.get("error", ""),
                 }
             )
         st.dataframe(pd.DataFrame(price_rows), use_container_width=True, hide_index=True)
-        st.caption("수동현재가가 입력된 자산은 수동현재가가 Yahoo 가격보다 우선 적용됩니다.")
+        st.caption("수동현재가가 온라인 가격보다 우선합니다. 국내 종목은 Naver, Yahoo 순서로 조회합니다.")
 
     with tab_export:
         csv_bytes = model_df.to_csv(index=False).encode("utf-8-sig")
