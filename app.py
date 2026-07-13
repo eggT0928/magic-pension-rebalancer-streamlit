@@ -573,7 +573,108 @@ def parse_google_sync_values(
             "accountName": clean_text(metadata.get("accountName")) or current.get("accountName", "연금저축"),
             "totalBalance": to_float(metadata.get("리밸런싱 기준금액"), current.get("totalBalance")),
             "principal": to_float(metadata.get("원금"), current.get("principal")),
-            "cash": to_float(metadata.get("예수…804 tokens truncated…          response = requests.get(url, headers=headers, timeout=8)
+            "cash": to_float(metadata.get("예수금"), current.get("cash")),
+            "assets": assets,
+        }
+    )
+
+
+def yahoo_symbols_for_ticker(ticker: str) -> list[str]:
+    ticker = clean_text(ticker)
+    if ticker == "현금":
+        return ["CASH"]
+    if ticker.startswith("KRX:"):
+        code = ticker.replace("KRX:", "").strip()
+        return [f"{code}.KS", f"{code}.KQ"]
+    return [ticker]
+
+
+def read_fast_price(symbol: str) -> float | None:
+    ticker = yf.Ticker(symbol)
+    try:
+        fast_info = ticker.fast_info
+        price = fast_info.get("last_price") if hasattr(fast_info, "get") else fast_info["last_price"]
+        if price and float(price) > 0:
+            return float(price)
+    except Exception:
+        pass
+
+    for period, interval in [("1d", "1m"), ("5d", "1d")]:
+        try:
+            history = ticker.history(period=period, interval=interval, auto_adjust=False)
+            if not history.empty and "Close" in history:
+                close = history["Close"].dropna()
+                if not close.empty and float(close.iloc[-1]) > 0:
+                    return float(close.iloc[-1])
+        except Exception:
+            continue
+    return None
+
+
+def naver_code_for_ticker(ticker: str) -> str | None:
+    ticker = clean_text(ticker)
+    if ticker.startswith("KRX:"):
+        return ticker.replace("KRX:", "").strip()
+    if re.fullmatch(r"[0-9A-Z]{6}", ticker):
+        return ticker
+    return None
+
+
+def parse_market_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    text = re.sub(r"[^0-9.\-]", "", text)
+    if text in {"", "-", ".", "-."}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def find_naver_quote_object(payload: Any, code: str) -> dict[str, Any] | None:
+    stack = [payload]
+    while stack:
+        value = stack.pop()
+        if not isinstance(value, (dict, list)):
+            continue
+        if isinstance(value, dict):
+            item_code = value.get("itemCode") or value.get("stockCode") or value.get("code") or value.get("cd")
+            has_price = (
+                value.get("closePrice")
+                or value.get("currentPrice")
+                or value.get("tradePrice")
+                or value.get("now")
+                or value.get("nv")
+                or value.get("lastPrice")
+            )
+            if has_price and (not item_code or str(item_code) == str(code)):
+                return value
+            stack.extend(child for child in value.values() if isinstance(child, (dict, list)))
+        else:
+            stack.extend(child for child in value if isinstance(child, (dict, list)))
+    return None
+
+
+def read_naver_price(code: str) -> float | None:
+    urls = [
+        f"https://api.stock.naver.com/stock/{code}/basic",
+        f"https://m.stock.naver.com/api/stock/{code}/basic",
+        f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}",
+    ]
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=8)
             response.raise_for_status()
             quote = find_naver_quote_object(response.json(), code)
             if not quote:
@@ -1032,4 +1133,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
